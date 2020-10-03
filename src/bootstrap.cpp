@@ -35,70 +35,43 @@
 #endif
 
 // LLVM includes
-#include "llvm/ADT/DenseMapInfo.h"
-#ifdef LLVM40
-#include "llvm/Bitcode/BitcodeWriter.h"
-#else
-#include "llvm/Bitcode/ReaderWriter.h"
-#endif
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/StringSwitch.h"
-#include "llvm/Support/Host.h"
-#include <llvm/ExecutionEngine/ExecutionEngine.h>
-#include "llvm/IR/ValueMap.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Type.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Verifier.h"
 
-
-// Clang includes
-#include "clang/Sema/ScopeInfo.h"
-#include "clang/AST/ASTContext.h"
-// Well, yes this is cheating
-#define private public
-#include "clang/Parse/Parser.h"
-#undef private
-#include "clang/Parse/ParseDiagnostic.h"
-#include "clang/AST/RecursiveASTVisitor.h"
-#include "clang/AST/StmtVisitor.h"
+// // Clang includes
+#include "clang/AST/AST.h"
 #include "clang/AST/DeclVisitor.h"
-#include "clang/AST/ASTConsumer.h"
-#include "clang/Sema/SemaConsumer.h"
-#include "clang/Frontend/ASTUnit.h"
-#include "clang/Analysis/DomainSpecific/CocoaConventions.h"
-#include "clang/Basic/Diagnostic.h"
-#include "clang/Basic/SourceManager.h"
-#include "clang/Basic/TargetInfo.h"
-#include "clang/Lex/PreprocessorOptions.h"
-#include "clang/Lex/Preprocessor.h"
-#include "clang/Lex/HeaderSearch.h"
-#include "clang/Parse/ParseAST.h"
+#include "clang/AST/ExprCXX.h"
+#include "clang/AST/PrettyDeclStackTrace.h"
+#include "clang/CodeGen/CGFunctionInfo.h"
+#include "clang/Frontend/FrontendOptions.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Lex/Lexer.h"
+#include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Sema/Sema.h"
-#include "clang/Frontend/FrontendAction.h"
-#include "clang/Sema/SemaDiagnostic.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Initialization.h"
-#include "clang/Sema/PrettyDeclStackTrace.h"
+#include "clang/Sema/SemaDiagnostic.h"
 #include "clang/Serialization/ASTWriter.h"
-#include "clang/Frontend/MultiplexConsumer.h"
-#include "clang/Basic/VirtualFileSystem.h"
-#include "Sema/TypeLocBuilder.h"
-#include <clang/Frontend/CompilerInstance.h>
-#include <clang/Frontend/CodeGenOptions.h>
-#include <clang/AST/Type.h>
-#include <clang/AST/ASTContext.h>
-#include <clang/AST/DeclTemplate.h>
-#include <clang/Basic/Specifiers.h>
-#include <clang/CodeGen/CGFunctionInfo.h>
-#include <clang/Parse/RAIIObjectsForParser.h>
-
-#include "CodeGen/CodeGenModule.h"
-#include <CodeGen/CodeGenTypes.h>
+// Well, yes this is cheating
 #define private public
-#include <CodeGen/CodeGenFunction.h>
+#include "clang/Parse/Parser.h" // 'DeclSpecContext' 'ParseDeclarator'
+#undef private
+#include "clang/Parse/RAIIObjectsForParser.h"
+
+// clang/lib/
+#include "Sema/TypeLocBuilder.h"
+#include "CodeGen/CodeGenModule.h"
+#define private public
+#include "CodeGen/CodeGenFunction.h"
 #undef private
 #include "CodeGen/CGCXXABI.h"
+#include "Sema/TypeLocBuilder.h"
 
 #ifdef _OS_WINDOWS_
 #define STDCALL __stdcall
@@ -237,8 +210,7 @@ JL_DLLEXPORT void add_directory(CxxInstance *Cxx, int kind, int isFramework, con
 JL_DLLEXPORT int isCCompiler(CxxInstance *Cxx)
 {
     return Cxx->CI->getLangOpts().CPlusPlus == 0 &&
-           Cxx->CI->getLangOpts().ObjC1 == 0 &&
-           Cxx->CI->getLangOpts().ObjC2 == 0;
+           Cxx->CI->getLangOpts().ObjC == 0;
 }
 
 JL_DLLEXPORT int _cxxparse(CxxInstance *Cxx)
@@ -527,7 +499,7 @@ JL_DLLEXPORT void *SpecializeClass(CxxInstance *Cxx, clang::ClassTemplateDecl *t
     ret = clang::ClassTemplateSpecializationDecl::Create(Cxx->CI->getASTContext(),
                             tmplt->getTemplatedDecl()->getTagKind(),
                             tmplt->getDeclContext(),
-                            tmplt->getTemplatedDecl()->getLocStart(),
+                            tmplt->getTemplatedDecl()->getBeginLoc(),
                             tmplt->getLocation(),
                             tmplt,
 #ifndef LLVM39
@@ -781,14 +753,11 @@ static Function *CloneFunctionAndAdjust(CxxInstance *Cxx, Function *F, FunctionT
     bool isboxed = false;
     Type *retty = f_julia_type_to_llvm(jl_retty, &isboxed);
     if (isboxed || (Call->getType()->isPointerTy() &&
-      cast<PointerType>(Call->getType())->getElementType()->isAggregateType())) {
-      Cxx->CGF->EmitAggregateCopy(Cxx->CGF->ReturnValue,
-#ifdef LLVM38
-                                  clang::CodeGen::Address(Call,clang::CharUnits::fromQuantity(sizeof(void*))),
-#else
-                                  Call,
-#endif
-                                  FD->getReturnType());
+        cast<PointerType>(Call->getType())->getElementType()->isAggregateType())) {
+      clang::QualType type = FD->getReturnType();
+      clang::CodeGen::LValue dest = Cxx->CGF->MakeAddrLValue(Cxx->CGF->ReturnValue, type);
+      clang::CodeGen::LValue src = Cxx->CGF->MakeAddrLValue(clang::CodeGen::Address(Call, clang::CharUnits::fromQuantity(sizeof(void*))), type);
+      Cxx->CGF->EmitAggregateCopy(dest, src, type, clang::CodeGen::AggValueSlot::DoesNotOverlap);
       Cxx->CGF->EmitFunctionEpilog(FI, false, clang::SourceLocation());
     } else {
       Value *Ret = Call;
@@ -959,8 +928,7 @@ JL_DLLEXPORT bool ParseFunctionStatementBody(CxxInstance *Cxx, clang::Decl *D)
   assert(Cxx->Parser->getCurToken().is(clang::tok::l_brace));
   clang::SourceLocation LBraceLoc = Cxx->Parser->getCurToken().getLocation();
 
-  clang::PrettyDeclStackTraceEntry CrashInfo(sema, D, LBraceLoc,
-                                      "parsing function body");
+  clang::PrettyDeclStackTraceEntry CrashInfo(Cxx->CI->getASTContext(), D, LBraceLoc, "parsing function body");
 
   // Do not enter a scope for the brace, as the arguments are in the same scope
   // (the function body) as the body itself.  Instead, just read the statement
@@ -1017,9 +985,7 @@ JL_DLLEXPORT void *ActOnStartNamespaceDef(CxxInstance *Cxx, char *name)
 {
   Cxx->Parser->EnterScope(clang::Scope::DeclScope);
   clang::ParsedAttributes attrs(Cxx->Parser->getAttrFactory());
-#ifdef LLVM38
   clang::UsingDirectiveDecl *UsingDecl = nullptr;
-#endif
   return Cxx->CI->getSema().ActOnStartNamespaceDef(
       Cxx->Parser->getCurScope(),
       getTrivialSourceLocation(Cxx),
@@ -1027,10 +993,8 @@ JL_DLLEXPORT void *ActOnStartNamespaceDef(CxxInstance *Cxx, char *name)
       getTrivialSourceLocation(Cxx),
       Cxx->Parser->getPreprocessor().getIdentifierInfo(name),
       getTrivialSourceLocation(Cxx),
-      attrs.getList()
-#ifdef LLVM38
-      ,UsingDecl
-#endif
+      attrs,
+      UsingDecl
     );
 }
 
@@ -1103,19 +1067,26 @@ JL_DLLEXPORT int typeconstruct(CxxInstance *Cxx,void *type, clang::Expr **rawexp
 JL_DLLEXPORT void *BuildCXXNewExpr(CxxInstance *Cxx, clang::Type *type, clang::Expr **exprs, size_t nexprs)
 {
   clang::QualType Ty = clang::QualType::getFromOpaquePtr(type);
-    clang::SourceManager &sm = Cxx->CI->getSourceManager();
-  return (void*) Cxx->CI->getSema().BuildCXXNew(clang::SourceRange(),
-    false, getTrivialSourceLocation(Cxx),
-    clang::MultiExprArg(), getTrivialSourceLocation(Cxx), clang::SourceRange(),
-    Ty, Cxx->CI->getASTContext().getTrivialTypeSourceInfo(Ty),
-    NULL, clang::SourceRange(sm.getLocForStartOfFile(sm.getMainFileID()),
-      sm.getLocForStartOfFile(sm.getMainFileID())),
-    new (Cxx->CI->getASTContext()) clang::ParenListExpr(Cxx->CI->getASTContext(),getTrivialSourceLocation(Cxx),
-      ArrayRef<clang::Expr*>(exprs, nexprs), getTrivialSourceLocation(Cxx))
-#ifndef LLVM40
-      ,false
-#endif
-    ).get();
+  clang::SourceManager &sm = Cxx->CI->getSourceManager();
+  return (void*) Cxx->CI->getSema().BuildCXXNew(
+                    clang::SourceRange(),
+                    false,
+                    getTrivialSourceLocation(Cxx),
+                    clang::MultiExprArg(),
+                    getTrivialSourceLocation(Cxx),
+                    clang::SourceRange(),
+                    Ty,
+                    Cxx->CI->getASTContext().getTrivialTypeSourceInfo(Ty),
+                    NULL,
+                    clang::SourceRange(sm.getLocForStartOfFile(sm.getMainFileID()),
+                                       sm.getLocForStartOfFile(sm.getMainFileID())),
+                    clang::ParenListExpr::Create(
+                        Cxx->CI->getASTContext(),
+                        getTrivialSourceLocation(Cxx),
+                        ArrayRef<clang::Expr*>(exprs, nexprs),
+                        getTrivialSourceLocation(Cxx)
+                      )
+                  ).get();
   //return (clang_astcontext) new clang::CXXNewExpr(clang_astcontext, false, nE, dE, )
 }
 
@@ -1125,7 +1096,7 @@ JL_DLLEXPORT void *EmitCXXNewExpr(CxxInstance *Cxx, clang::Expr *E)
   return (void*)Cxx->CGF->EmitCXXNewExpr(cast<clang::CXXNewExpr>(E));
 }
 
-JL_DLLEXPORT void *build_call_to_member(CxxInstance *Cxx, clang::Expr *MemExprE,clang::Expr **exprs, size_t nexprs)
+JL_DLLEXPORT void *build_call_to_member(CxxInstance *Cxx, clang::Expr *MemExprE, clang::Expr **exprs, size_t nexprs)
 {
   if (MemExprE->getType() == Cxx->CI->getASTContext().BoundMemberTy ||
          MemExprE->getType() == Cxx->CI->getASTContext().OverloadTy)
@@ -1135,10 +1106,14 @@ JL_DLLEXPORT void *build_call_to_member(CxxInstance *Cxx, clang::Expr *MemExprE,
     return NULL;
   }
   else {
-    return (void*) new (&Cxx->CI->getASTContext()) clang::CXXMemberCallExpr(Cxx->CI->getASTContext(),
-        MemExprE,ArrayRef<clang::Expr*>(exprs,nexprs),
-        cast<clang::CXXMethodDecl>(cast<clang::MemberExpr>(MemExprE)->getMemberDecl())->getReturnType(),
-        clang::VK_RValue,getTrivialSourceLocation(Cxx));
+    return (void*) clang::CXXMemberCallExpr::Create(
+                      Cxx->CI->getASTContext(),
+                      MemExprE,
+                      ArrayRef<clang::Expr*>(exprs, nexprs),
+                      cast<clang::CXXMethodDecl>(cast<clang::MemberExpr>(MemExprE)->getMemberDecl())->getReturnType(),
+                      clang::VK_RValue,
+                      getTrivialSourceLocation(Cxx)
+                    );
   }
 }
 
@@ -1508,14 +1483,14 @@ static void finish_clang_init(CxxInstance *Cxx, bool EmitPCH, const char *PCHBuf
       std::make_shared<clang::TargetOptions>(Cxx->CI->getTargetOpts())));
     clang::TargetInfo &tin = Cxx->CI->getTarget();
     if (PCHBuffer) {
-        llvm::IntrusiveRefCntPtr<clang::vfs::OverlayFileSystem>
-          Overlay(new clang::vfs::OverlayFileSystem(
-            clang::vfs::getRealFileSystem()));
-        llvm::IntrusiveRefCntPtr<clang::vfs::InMemoryFileSystem> IMFS(
-          new clang::vfs::InMemoryFileSystem);
-        IMFS->addFile("/Cxx.pch", PCHTime, llvm::MemoryBuffer::getMemBuffer(
-          StringRef(PCHBuffer, PCHBufferSize), "Cxx.pch", false
-        ));
+        llvm::IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> Overlay(
+           new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
+        llvm::IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> IMFS(new llvm::vfs::InMemoryFileSystem);
+        IMFS->addFile(
+            "/Cxx.pch",
+            PCHTime,
+            llvm::MemoryBuffer::getMemBuffer(StringRef(PCHBuffer, PCHBufferSize), "Cxx.pch", false)
+          );
         Overlay->pushOverlay(IMFS);
         Cxx->CI->setVirtualFileSystem(Overlay);
     }
@@ -1607,7 +1582,7 @@ static void finish_clang_init(CxxInstance *Cxx, bool EmitPCH, const char *PCHBuf
     clang::SourceManager &sm = Cxx->CI->getSourceManager();
     const char *fname = PCHBuffer ? "/Cxx.cpp" : "/Cxx.h";
     const clang::FileEntry *MainFile = Cxx->CI->getFileManager().getVirtualFile(fname, 0, time(0));
-    sm.overrideFileContents(MainFile, llvm::MemoryBuffer::getNewMemBuffer(0, fname));
+    sm.overrideFileContents(MainFile, llvm::WritableMemoryBuffer::getNewMemBuffer(0, fname));
     sm.setMainFileID(sm.createFileID(MainFile, clang::SourceLocation(), clang::SrcMgr::C_User));
 
     sema.getPreprocessor().EnterMainSourceFile();
@@ -2097,7 +2072,7 @@ JL_DLLEXPORT void *GetFunctionReturnType(clang::FunctionDecl *FD)
 
 JL_DLLEXPORT void *BuildDecltypeType(CxxInstance *Cxx, clang::Expr *E)
 {
-    clang::QualType T = Cxx->CI->getSema().BuildDecltypeType(E,E->getLocStart());
+    clang::QualType T = Cxx->CI->getSema().BuildDecltypeType(E,E->getBeginLoc());
     return Cxx->CI->getASTContext().getCanonicalType(T).getAsOpaquePtr();
 }
 
@@ -2733,7 +2708,7 @@ JL_DLLEXPORT void FinalizeAnonClass(CxxInstance *Cxx, clang::CXXRecordDecl *TheC
 {
   llvm::SmallVector<clang::Decl *, 0> Fields;
   Cxx->CI->getSema().ActOnFields(nullptr, clang::SourceLocation(), TheClass,
-                       Fields, clang::SourceLocation(), clang::SourceLocation(), nullptr);
+                       Fields, clang::SourceLocation(), clang::SourceLocation(), clang::ParsedAttributesView());
   Cxx->CI->getSema().CheckCompletedCXXClass(TheClass);
 }
 
@@ -2861,8 +2836,15 @@ CreateFunctionRefExpr(clang::Sema &S, clang::FunctionDecl *Fn, clang::NamedDecl 
   // being used.
   if (FoundDecl != Fn && S.DiagnoseUseOfDecl(Fn, Loc))
     return clang::ExprError();
-  clang::DeclRefExpr *DRE = new (S.Context) clang::DeclRefExpr(Fn, false, Fn->getType(),
-                                                 clang::VK_LValue, Loc, LocInfo);
+  clang::DeclRefExpr *DRE = new (S.Context) clang::DeclRefExpr(
+                                              S.Context,
+                                              Fn,
+                                              false,
+                                              Fn->getType(),
+                                              clang::VK_LValue,
+                                              Loc,
+                                              LocInfo
+                                            );
   if (HadMultipleCandidates)
     DRE->setHadMultipleCandidates(true);
 
@@ -2878,13 +2860,13 @@ CreateFunctionRefExpr(clang::Sema &S, clang::FunctionDecl *Fn, clang::NamedDecl 
 JL_DLLEXPORT void *CreateCStyleCast(CxxInstance *Cxx, clang::Expr *E, clang::Type *T)
 {
   clang::QualType QT(T,0);
-  return (void*)clang::CStyleCastExpr::Create (Cxx->CI->getASTContext(), QT, clang::VK_RValue, clang::CK_BitCast,
+  return (void*)clang::CStyleCastExpr::Create(Cxx->CI->getASTContext(), QT, clang::VK_RValue, clang::CK_BitCast,
     E, nullptr, Cxx->CI->getASTContext().getTrivialTypeSourceInfo(QT), clang::SourceLocation(), clang::SourceLocation());
 }
 
 JL_DLLEXPORT void *CreateReturnStmt(CxxInstance *Cxx, clang::Expr *E)
 {
-  return (void*)new (Cxx->CI->getASTContext()) clang::ReturnStmt(clang::SourceLocation(),E,nullptr);
+  return (void*) clang::ReturnStmt::Create(Cxx->CI->getASTContext(), clang::SourceLocation(), E, nullptr);
 }
 
 JL_DLLEXPORT void *CreateThisExpr(CxxInstance *Cxx, void *T)
